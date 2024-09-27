@@ -12,6 +12,7 @@ import (
 	//"context"
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -20,15 +21,7 @@ import (
 	"github.com/Nerzal/gocloak/v13"
 )
 
-type SignUp struct {
-	Username string `json:"username"`
-	Psw      string `json:"psw"`
-	Ip       string `json:"ip_address"`
-	WgPubKey string `json:"wg_pubkey"`
-	Priv     int32  `json:"privileges"`
-}
-
-type login struct {
+type authReq struct {
 	Username string `json:"username"`
 	Psw      string `json:"psw"`
 }
@@ -49,6 +42,7 @@ var (
 	kcSecret  string
 	admin     string
 	admin_psw string
+	signal    string
 )
 
 func init() {
@@ -72,40 +66,33 @@ func init() {
 }
 
 func SignUpHandler(w http.ResponseWriter, r *http.Request) {
-	// Parse the incoming JSON request
-	var req SignUp
+	var req authReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
-	// Initialize Keycloak client
 	token, err := kcClient.LoginAdmin(r.Context(), admin, admin_psw, realm)
 	if err != nil {
 		http.Error(w, "Keycloak authentication failed", http.StatusInternalServerError)
 		return
 	}
 
-	// Register the user with Keycloak
 	userID, err := RegisterKeycloakUser(r, kcClient, token.AccessToken, req.Username, req.Psw)
 	if err != nil {
 		http.Error(w, "Failed to register user with Keycloak", http.StatusInternalServerError)
 		return
 	}
 
-	// Store user data in SQLite database
 	newPeer := Peer{
 		Id:         userID,
 		Username:   req.Username,
-		Ip_address: req.Ip,
-		Wg_pubkey:  req.WgPubKey,
 		Created_at: time.Now().String(),
-		Privilege:  req.Priv,
+		Privilege:  0,
 	}
 
 	createPeer(&newPeer)
 
-	// Respond with success
 	w.WriteHeader(http.StatusCreated)
 	fmt.Fprintf(w, "User %s successfully registered", req.Username)
 
@@ -128,7 +115,6 @@ func RegisterKeycloakUser(r *http.Request, client *gocloak.GoCloak, accessToken,
 		},
 	}
 
-	// Create the user in Keycloak
 	userID, err := client.CreateUser(r.Context(), accessToken, realm, user)
 	if err != nil {
 		return "", err
@@ -138,16 +124,14 @@ func RegisterKeycloakUser(r *http.Request, client *gocloak.GoCloak, accessToken,
 }
 
 func LoginHandler(w http.ResponseWriter, r *http.Request) {
-	var loginReq login
+	var loginReq authReq
 
-	// Decode the JSON body
 	err := json.NewDecoder(r.Body).Decode(&loginReq)
 	if err != nil {
 		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
-	// Authenticate with Keycloak
 	token, err := kcClient.Login(r.Context(), clientID, kcSecret, realm, loginReq.Username, loginReq.Psw)
 	if err != nil {
 		log.Printf("Failed to login: %v", err)
@@ -155,7 +139,6 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Send the token to the agent
 	response := response{
 		AccessToken: token.AccessToken,
 		ExpireIn:    token.ExpiresIn,
@@ -168,9 +151,71 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 	mutex.Unlock()
 }
 
-func management() {
+func PeersOnlineHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	err := json.NewEncoder(w).Encode(clients)
+	if err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
+}
+
+func getLocalIP() (string, error) {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String(), nil
+}
+
+func SetSignal(w http.ResponseWriter, r *http.Request) {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	var data struct {
+		IP string `json:"ip"`
+	}
+
+	err := json.NewDecoder(r.Body).Decode(&data)
+	if err != nil {
+		http.Error(w, "Invalid data", http.StatusBadRequest)
+		return
+	}
+
+	signal = data.IP
+	fmt.Printf("Received STUN server IP: %s\n", signal)
+	w.WriteHeader(http.StatusOK)
+}
+
+func GetSignal(w http.ResponseWriter, r *http.Request) {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	if signal == "" {
+		http.Error(w, "STUN server IP not available", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"ip": signal})
+}
+
+func Management() {
+	ip, err := getLocalIP()
+	if err != nil {
+		log.Fatalf("Could not get local IP address: %v", err)
+	}
+	fmt.Printf("Server will start on %s:8080\n", ip)
+	address := fmt.Sprintf("%s:8080", ip)
 	http.HandleFunc("/login", LoginHandler)
-	http.HandleFunc("/signup", LoginHandler)
-	log.Println("Server started on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	http.HandleFunc("/signup", SignUpHandler)
+	http.HandleFunc("/peers", PeersOnlineHandler)
+	http.HandleFunc("/set-signal", SetSignal)
+	http.HandleFunc("/get-signal", GetSignal)
+
+	log.Fatal(http.ListenAndServe(address, nil))
 }
