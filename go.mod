@@ -5,6 +5,7 @@ go 1.22.5
 require (
 	github.com/Nerzal/gocloak/v13 v13.9.0 // indirect
 	github.com/go-resty/resty/v2 v2.7.0 // indirect
+	github.com/golang-jwt/jwt/v4 v4.5.0 // indirect
 	github.com/golang-jwt/jwt/v5 v5.0.0 // indirect
 	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
